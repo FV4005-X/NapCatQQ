@@ -1,0 +1,176 @@
+name: Archive v4.18.42 Docker images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/archive-docker-v41842.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    name: Verify and archive v4.18.42 Docker tar files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Download, verify, and upload the original Docker archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="v4.18.42"
+          WORK="$RUNNER_TEMP/napcat-docker-archive"
+          mkdir -p "$WORK"
+          cd "$WORK"
+
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64)
+                expected_sha="85e3fd02b58fd836a0177734b6ff77a896000bcfcf209b3b200d7e8b8452df7c"
+                expected_size="612216320"
+                expected_sidecar_sha="872de741fa04fcfaa04802dc54ec7ba23fedf58263100f95b43314a7cc59f6f8"
+                ;;
+              arm64)
+                expected_sha="0d14594844e9135c760e710754a8778d98649de2ca837fce5a61b69b7d39954d"
+                expected_size="597573632"
+                expected_sidecar_sha="5d2a1ac826071ab1f8b7df0b0ad5ee619c83e097fc1bb4120aae4d8e7743f0e0"
+                ;;
+            esac
+
+            archive="napcat-docker-$TAG-$arch.tar"
+            sidecar="$archive.sha256"
+
+            echo "Downloading $archive"
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors \
+              --output "$archive" \
+              "https://github.com/XingYunStar/NapCatQQ/releases/download/$TAG/$archive"
+
+            echo "Downloading $sidecar"
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors \
+              --output "$sidecar" \
+              "https://github.com/XingYunStar/NapCatQQ/releases/download/$TAG/$sidecar"
+
+            actual_size="$(stat -c '%s' "$archive")"
+            actual_sha="$(sha256sum "$archive" | awk '{print $1}')"
+            actual_sidecar_sha="$(sha256sum "$sidecar" | awk '{print $1}')"
+            sidecar_sha="$(awk 'NR==1 {print $1}' "$sidecar")"
+
+            echo "$arch archive size: $actual_size"
+            echo "$arch archive SHA256: $actual_sha"
+            echo "$arch sidecar SHA256: $actual_sidecar_sha"
+
+            test "$actual_size" = "$expected_size"
+            test "$actual_sha" = "$expected_sha"
+            test "$sidecar_sha" = "$expected_sha"
+            test "$actual_sidecar_sha" = "$expected_sidecar_sha"
+            sha256sum --check "$sidecar"
+
+            echo "PASS: $arch archive and its original SHA256 sidecar are verified."
+          done
+
+          release_json="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          release_id="$(jq -er '.id' <<< "$release_json")"
+          is_draft="$(jq -r '.draft' <<< "$release_json")"
+          test "$is_draft" = "false"
+          echo "Target release: $GITHUB_REPOSITORY/releases/tag/$TAG (id=$release_id)"
+
+          upload_files=""
+
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64)
+                expected_sha="85e3fd02b58fd836a0177734b6ff77a896000bcfcf209b3b200d7e8b8452df7c"
+                expected_size="612216320"
+                expected_sidecar_sha="872de741fa04fcfaa04802dc54ec7ba23fedf58263100f95b43314a7cc59f6f8"
+                ;;
+              arm64)
+                expected_sha="0d14594844e9135c760e710754a8778d98649de2ca837fce5a61b69b7d39954d"
+                expected_size="597573632"
+                expected_sidecar_sha="5d2a1ac826071ab1f8b7df0b0ad5ee619c83e097fc1bb4120aae4d8e7743f0e0"
+                ;;
+            esac
+
+            archive="napcat-docker-$TAG-$arch.tar"
+            sidecar="$archive.sha256"
+
+            for name in "$archive" "$sidecar"; do
+              if [ "$name" = "$archive" ]; then
+                asset_size="$expected_size"
+                asset_digest="sha256:$expected_sha"
+              else
+                asset_size="99"
+                asset_digest="sha256:$expected_sidecar_sha"
+              fi
+
+              existing="$(jq -c --arg name "$name" '[.assets[] | select(.name == $name)][0] // empty' <<< "$release_json")"
+
+              if [ -n "$existing" ]; then
+                existing_size="$(jq -r '.size' <<< "$existing")"
+                existing_digest="$(jq -r '.digest // empty' <<< "$existing")"
+
+                if [ "$existing_size" != "$asset_size" ] || [ "$existing_digest" != "$asset_digest" ]; then
+                  echo "::error::Release already contains $name, but its size or SHA256 differs. Refusing to overwrite it."
+                  exit 1
+                fi
+
+                echo "Already present and verified: $name"
+              else
+                upload_files="$upload_files $name"
+              fi
+            done
+          done
+
+          if [ -n "$upload_files" ]; then
+            echo "Uploading verified Docker archive assets..."
+            gh release upload "$TAG" $upload_files --repo "$GITHUB_REPOSITORY"
+          else
+            echo "All four Docker archive assets are already present and verified."
+          fi
+
+          final_release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+
+          for arch in amd64 arm64; do
+            case "$arch" in
+              amd64)
+                expected_sha="85e3fd02b58fd836a0177734b6ff77a896000bcfcf209b3b200d7e8b8452df7c"
+                expected_size="612216320"
+                expected_sidecar_sha="872de741fa04fcfaa04802dc54ec7ba23fedf58263100f95b43314a7cc59f6f8"
+                ;;
+              arm64)
+                expected_sha="0d14594844e9135c760e710754a8778d98649de2ca837fce5a61b69b7d39954d"
+                expected_size="597573632"
+                expected_sidecar_sha="5d2a1ac826071ab1f8b7df0b0ad5ee619c83e097fc1bb4120aae4d8e7743f0e0"
+                ;;
+            esac
+
+            archive="napcat-docker-$TAG-$arch.tar"
+            sidecar="$archive.sha256"
+
+            for name in "$archive" "$sidecar"; do
+              if [ "$name" = "$archive" ]; then
+                asset_size="$expected_size"
+                asset_digest="sha256:$expected_sha"
+              else
+                asset_size="99"
+                asset_digest="sha256:$expected_sidecar_sha"
+              fi
+
+              asset="$(jq -ce --arg name "$name" '[.assets[] | select(.name == $name)][0]' <<< "$final_release")"
+              actual_size="$(jq -r '.size' <<< "$asset")"
+              actual_digest="$(jq -r '.digest // empty' <<< "$asset")"
+
+              test "$actual_size" = "$asset_size"
+              test "$actual_digest" = "$asset_digest"
+
+              echo "Release verified: $name ($actual_size bytes, $actual_digest)"
+            done
+          done
+
+          echo "SUCCESS: both original Docker archives and their SHA256 sidecars are stored in the v4.18.42 Release."

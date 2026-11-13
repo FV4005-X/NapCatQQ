@@ -1,0 +1,82 @@
+name: Compare XingYunStar v4.18.42 Release assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/compare-release-assets.yml
+      - .github/scripts/inspect-release-zip-metadata.py
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  compare:
+    name: Compare actual ZIP file contents (read-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout comparison script
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Get our previously successful v4.18.42 Release Candidate
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: NapCat.Release-Candidate-v4.18.42
+          run-id: 43281514637
+          github-token: ${{ github.token }}
+          path: ours
+
+      - name: Download and verify XingYunStar Release ZIPs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p third_party
+          download() {
+            local filename="$1"
+            local expected="$2"
+            local url="https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/$filename"
+            if ! curl -fL --retry 5 --retry-all-errors --retry-delay 3 --connect-timeout 30 --max-time 1200 \
+                --output "third_party/$filename" "$url"; then
+              echo "Direct download failed; using GitHub API."
+              rm -f "third_party/$filename"
+              gh release download v4.18.42 --repo XingYunStar/NapCatQQ \
+                --pattern "$filename" --dir third_party --clobber
+            fi
+            echo "$expected  third_party/$filename" | sha256sum --check --strict -
+          }
+          download NapCat.Framework.zip 118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e
+          download NapCat.Shell.zip 02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d
+          download NapCat.Shell.Windows.Node.zip 77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed
+
+      - name: Verify our previously published candidate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd ours && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Run byte-for-byte comparison and export full report
+        run: |
+          python3 .github/scripts/compare-release-assets.py \
+            --ours-dir ours \
+            --third-party-dir third_party \
+            --output-dir comparison
+          cat comparison/COMPARISON.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Analyze historical ZIP metadata and compressed streams
+        run: |
+          python3 .github/scripts/inspect-release-zip-metadata.py
+          cat comparison/ZIP-METADATA.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload complete report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat-v4.18.42-XingYunStar-vs-FV4005-X-report
+          path: comparison/
+          if-no-files-found: warn
+          retention-days: 30

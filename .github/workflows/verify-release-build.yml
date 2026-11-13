@@ -1,0 +1,151 @@
+name: Verify NapCat Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Git tag to build and verify (for example, v4.18.42)"
+        required: true
+        type: string
+        default: "v4.18.42"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-release-build-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Validate version format
+        id: validate
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${VERSION}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid version tag: ${VERSION}"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm tag exists in this repository
+        env:
+          VERSION: ${{ steps.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${VERSION}" >/dev/null
+          echo "Found tag ${VERSION} in ${GITHUB_REPOSITORY}."
+
+  quality:
+    name: Type Check and Tests
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.version }}
+          fetch-depth: 1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 20.19.5
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type Check
+        run: pnpm run typecheck
+
+      - name: Run Tests
+        run: pnpm test
+
+  build:
+    name: Build NapCat.${{ matrix.target.name }}
+    needs: [validate, quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: Framework
+            build_cmd: build:framework
+            src_dir: packages/napcat-framework/dist
+            dist_dir: framework-dist
+          - name: Shell
+            build_cmd: build:shell
+            src_dir: packages/napcat-shell/dist
+            dist_dir: shell-dist
+
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: ${{ needs.validate.outputs.version }}
+          fetch-depth: 1
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
+        with:
+          version: 9.15.9
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 20.19.5
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build WebUI
+        run: pnpm --filter napcat-webui-frontend run build
+
+      - name: Build target
+        env:
+          BUILD_CMD: ${{ matrix.target.build_cmd }}
+          NAPCAT_VERSION: ${{ needs.validate.outputs.version }}
+        run: pnpm run "$BUILD_CMD"
+
+      - name: Build built-in plugins
+        run: pnpm --filter napcat-plugin-builtin run build
+
+      - name: Prepare distributable
+        env:
+          SRC_DIR: ${{ matrix.target.src_dir }}
+          DIST_DIR: ${{ matrix.target.dist_dir }}
+        run: |
+          set -euo pipefail
+          test -d "$SRC_DIR"
+          mv "$SRC_DIR" "$DIST_DIR"
+          cd "$DIST_DIR"
+          npm pkg delete devDependencies
+          npm install --omit=dev
+
+      - name: Upload build artifact (not a Release)
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat.${{ matrix.target.name }}-${{ needs.validate.outputs.version }}
+          path: ${{ matrix.target.dist_dir }}
+          if-no-files-found: error
+          retention-days: 14

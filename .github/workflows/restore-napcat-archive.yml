@@ -1,0 +1,225 @@
+name: Restore NapCat archive tags and releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      restore_tags:
+        description: Import all 761 historical Git tags from the archive
+        required: true
+        type: boolean
+        default: true
+      publish_release_assets:
+        description: I confirm I am authorized to redistribute these assets under the applicable license terms
+        required: true
+        type: boolean
+        default: false
+      publish_docker_assets:
+        description: "I confirm I am authorized to redistribute these Docker images and all bundled third-party components"
+        required: true
+        type: boolean
+        default: false
+      release_version:
+        description: "Archived release version (available: v4.18.42, v4.18.19, v4.17.23, v4.15.0)"
+        required: false
+        type: string
+        default: v4.18.42
+
+permissions:
+  contents: write
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify restore token
+        env:
+          RESTORE_TOKEN: ${{ secrets.NAPCAT_RESTORE_TOKEN }}
+        run: |
+          if [ -z "${RESTORE_TOKEN}" ]; then
+            echo "::error::Missing NAPCAT_RESTORE_TOKEN. Add a PAT with Contents: write and Workflows: write."
+            exit 1
+          fi
+
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # A PAT with Contents: write and Workflows: write is required because
+          # archived tags point to commits that contain .github/workflows files.
+          token: ${{ secrets.NAPCAT_RESTORE_TOKEN }}
+
+      - name: Import all historical tags
+        if: ${{ inputs.restore_tags }}
+        env:
+          ARCHIVE_REPO: XingYunStar/NapCatQQ
+        run: |
+          set -euo pipefail
+          git remote add napcat-archive "https://github.com/${ARCHIVE_REPO}.git"
+          git fetch napcat-archive --force '+refs/tags/*:refs/tags/*'
+
+          tag_count="$(git for-each-ref refs/tags --format='%(refname:strip=2)' | wc -l | tr -d ' ')"
+          echo "Fetched tags: ${tag_count}"
+          if [ "${tag_count}" -ne 761 ]; then
+            echo "::error::Expected 761 tags from the archive, got ${tag_count}."
+            exit 1
+          fi
+
+          # Push tags in small atomic batches. A single 761-ref push can make
+          # GitHub's repository-rule evaluation time out.
+          mapfile -t tag_refs < <(git for-each-ref refs/tags --format='%(refname)')
+          batch_size=10
+          total=${#tag_refs[@]}
+          for ((i=0; i<total; i+=batch_size)); do
+            batch=("${tag_refs[@]:i:batch_size}")
+            refspecs=()
+            for ref in "${batch[@]}"; do
+              refspecs+=("${ref}:${ref}")
+            done
+            echo "Pushing tags $((i+1))-$((i+${#batch[@]})) of ${total}"
+            git push --atomic origin "${refspecs[@]}"
+          done
+
+          remote_count="$(git ls-remote --tags origin | grep -v '\^{}' | wc -l | tr -d ' ')"
+          echo "Tags now present on target: ${remote_count}"
+          if [ "${remote_count}" -ne 761 ]; then
+            echo "::error::Expected 761 tags on the target, got ${remote_count}."
+            exit 1
+          fi
+
+      - name: Recreate an archived release (optional)
+        if: ${{ inputs.publish_release_assets }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_REPO: XingYunStar/NapCatQQ
+          TARGET_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          case "${VERSION}" in
+            v4.18.42|v4.18.19|v4.17.23|v4.15.0) ;;
+            *) echo "::error::This archive currently has release assets only for v4.18.42, v4.18.19, v4.17.23, and v4.15.0."; exit 1 ;;
+          esac
+
+          git show-ref --verify --quiet "refs/tags/${VERSION}" || {
+            echo "::error::Tag ${VERSION} is missing. Run the tag import first."
+            exit 1
+          }
+
+          mkdir -p release-assets
+          gh release view "${VERSION}" --repo "${ARCHIVE_REPO}" --json name,body > release.json
+          title="$(jq -r '.name' release.json)"
+          jq -r '.body' release.json > release-notes.md
+
+          # Copy the three standalone NapCat packages. The OneKey package may bundle
+          # a proprietary QQ client, so it is intentionally excluded. Large Docker
+          # image TARs are also excluded.
+          gh release download "${VERSION}" --repo "${ARCHIVE_REPO}" --dir release-assets \
+            --pattern 'NapCat.Framework.zip' \
+            --pattern 'NapCat.Shell.Windows.Node.zip' \
+            --pattern 'NapCat.Shell.zip'
+
+          for file in \
+            NapCat.Framework.zip \
+            NapCat.Shell.Windows.Node.zip \
+            NapCat.Shell.zip; do
+            test -s "release-assets/${file}" || {
+              echo "::error::Missing release asset: ${file}"
+              exit 1
+            }
+          done
+
+          cp LICENSE release-assets/LICENSE.txt
+          cat >> release-notes.md <<'EOF'
+
+          ---
+
+          **Archive provenance:** This is a community archival copy recreated from
+          `XingYunStar/NapCatQQ`, not a release published by the original upstream
+          maintainers. Original project: `NapNeko/NapCatQQ`.
+
+          The full NapCat license is included as `LICENSE.txt`. Redistribution
+          remains subject to that license and any applicable third-party terms.
+          EOF
+
+          gh release create "${VERSION}" release-assets/* \
+            --repo "${TARGET_REPO}" \
+            --title "${title} (archive copy)" \
+            --notes-file release-notes.md \
+            --verify-tag
+
+      - name: Append Docker images to an existing release
+        if: ${{ inputs.publish_docker_assets }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARCHIVE_REPO: XingYunStar/NapCatQQ
+          TARGET_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.release_version }}
+        run: |
+          set -euo pipefail
+          case "${VERSION}" in
+            v4.18.42|v4.18.19|v4.17.23|v4.15.0) ;;
+            *) echo "::error::Unsupported archived release version: ${VERSION}"; exit 1 ;;
+          esac
+
+          git show-ref --verify --quiet "refs/tags/${VERSION}" || {
+            echo "::error::Tag ${VERSION} is missing. Restore tags first."
+            exit 1
+          }
+          gh release view "${VERSION}" --repo "${TARGET_REPO}" >/dev/null || {
+            echo "::error::The target Release ${VERSION} does not exist. Restore its base Release first."
+            exit 1
+          }
+
+          mkdir -p docker-assets
+          gh release view "${VERSION}" --repo "${ARCHIVE_REPO}" --json assets > source-release.json
+          mapfile -t expected_assets < <(jq -r '.assets[].name | select(startswith("napcat-docker-"))' source-release.json)
+          if [ "${#expected_assets[@]}" -eq 0 ]; then
+            echo "::error::No Docker image assets were found in the source Release ${VERSION}."
+            exit 1
+          fi
+
+          gh release download "${VERSION}" --repo "${ARCHIVE_REPO}" --dir docker-assets --pattern 'napcat-docker-*'
+
+          # Verify every downloaded Docker asset against GitHub's published SHA-256 digest.
+          for name in "${expected_assets[@]}"; do
+            file="docker-assets/${name}"
+            test -s "${file}" || { echo "::error::Missing or empty Docker asset: ${name}"; exit 1; }
+            expected_digest="$(jq -r --arg name "${name}" '.assets[] | select(.name == $name) | .digest // empty' source-release.json)"
+            if [[ "${expected_digest}" == sha256:* ]]; then
+              expected_digest="${expected_digest#sha256:}"
+              actual_digest="$(sha256sum "${file}" | awk '{print $1}')"
+              if [ "${actual_digest}" != "${expected_digest}" ]; then
+                echo "::error::SHA-256 mismatch for ${name}"
+                exit 1
+              fi
+            fi
+          done
+
+          # Also verify the archive-provided checksum manifests against their TAR files.
+          checksum_count=0
+          for checksum in docker-assets/*.tar.sha256; do
+            [ -f "${checksum}" ] || continue
+            (cd docker-assets && sha256sum -c "$(basename "${checksum}")")
+            checksum_count=$((checksum_count + 1))
+          done
+          if [ "${checksum_count}" -eq 0 ]; then
+            echo "::error::No Docker SHA-256 checksum files were found."
+            exit 1
+          fi
+
+          downloaded_count="$(find docker-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [ "${downloaded_count}" -ne "${#expected_assets[@]}" ]; then
+            echo "::error::Downloaded ${downloaded_count} Docker files, expected ${#expected_assets[@]}."
+            exit 1
+          fi
+
+          # Append to the existing Release. --clobber makes reruns safe.
+          gh release upload "${VERSION}" docker-assets/* --repo "${TARGET_REPO}" --clobber
+          gh release view "${VERSION}" --repo "${TARGET_REPO}" --json assets > target-release.json
+          for name in "${expected_assets[@]}"; do
+            jq -e --arg name "${name}" '.assets[] | select(.name == $name)' target-release.json >/dev/null || {
+              echo "::error::Docker asset was not found on the target Release: ${name}"
+              exit 1
+            }
+          done
+          echo "Successfully appended and verified ${downloaded_count} Docker assets for ${VERSION}."

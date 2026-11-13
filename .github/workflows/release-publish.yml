@@ -4,19 +4,26 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version tag (e.g., v4.10.7)'
+        description: 'Release version tag (e.g., v4.18.42)'
         required: true
         type: string
+      publish_release:
+        description: 'Publish or update the GitHub Release after the dry-run checks pass'
+        required: true
+        type: boolean
+        default: false
 
-permissions: write-all
-
-env:
-  RELEASE_NAME: "NapCat"
+permissions:
+  contents: read
 
 jobs:
   build:
     name: Build NapCat.${{ matrix.target.name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
     strategy:
       matrix:
         target:
@@ -30,61 +37,339 @@ jobs:
             dist_dir: shell-dist
     steps:
       - name: Clone Main Repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ inputs.version }}
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1
         with:
-          version: 9
+          version: 9.15.9
           run_install: false
       - name: Use Node.js 20.x
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
-          node-version: 20.x
-      - name: Build NapCat.${{ matrix.target.name }}
+          node-version: 20.19.5
+      - name: Verify fixed build toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node --version)" = "v20.19.5"
+          test "$(npm --version)" = "10.8.2"
+          test "$(pnpm --version)" = "9.15.9"
+
+      - name: Build and assemble locked runtime dependencies
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_TAG: ${{ inputs.version }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          TARGET_BUILD_CMD: ${{ matrix.target.build_cmd }}
+          SOURCE_DIR: ${{ matrix.target.src_dir }}
+          DIST_DIR: ${{ matrix.target.dist_dir }}
           NAPCAT_VERSION: ${{ inputs.version }}
+        shell: bash
         run: |
-          pnpm i
-          pnpm --filter napcat-webui-frontend run build || exit 1
-          pnpm run ${{ matrix.target.build_cmd }}
-          pnpm --filter napcat-plugin-builtin run build || exit 1
-          mv ${{ matrix.target.src_dir }} ${{ matrix.target.dist_dir }}
-          cd ${{ matrix.target.dist_dir }}
-          # --omit=dev still resolves dev peer dependencies; remove build tooling first.
-          npm pkg delete devDependencies
-          npm install --omit=dev
-          rm ./package-lock.json || exit 0
+          set -euo pipefail
+
+          if [[ ! "$SOURCE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid release tag: $SOURCE_TAG"
+            exit 1
+          fi
+
+          SOURCE_COMMIT="$(git rev-parse "$SOURCE_TAG^{commit}")"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          LOCKFILE_SHA256="$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)"
+          WORKSPACE_SHA256="$(sha256sum pnpm-workspace.yaml | cut -d ' ' -f1)"
+          export SOURCE_COMMIT SOURCE_DATE_EPOCH LOCKFILE_SHA256 WORKSPACE_SHA256
+          export TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+          echo "Source tag: $SOURCE_TAG"
+          echo "Source commit: $SOURCE_COMMIT"
+          echo "pnpm-lock.yaml SHA256: $LOCKFILE_SHA256"
+          echo "Node: $(node --version); npm: $(npm --version); pnpm: $(pnpm --version)"
+
+          # Build dependencies are installed strictly from the source tag's lockfile.
+          pnpm install --frozen-lockfile
+          pnpm --filter napcat-webui-frontend run build
+          pnpm run "$TARGET_BUILD_CMD"
+          pnpm --filter napcat-plugin-builtin run build
+
+          test -d "$SOURCE_DIR"
+          mv "$SOURCE_DIR" "$DIST_DIR"
+
+          # The Vite build copies the workspace-root package.json into the distributable.
+          # Install that root package's locked production graph in an isolated temporary
+          # project to avoid workspace-filtered hoisted installs (which are unreliable
+          # with pnpm 9.15.9). Never modify the checked-out source lockfile.
+          RUNTIME_DIR="$(mktemp -d)"
+          cp package.json pnpm-lock.yaml "$RUNTIME_DIR/"
+          printf '%s\n' 'node-linker=hoisted' > "$RUNTIME_DIR/.npmrc"
+
+          # The source lockfile includes importers for the entire monorepo.
+          # Keep only the workspace-root importer in this temporary copy.
+          # All original package snapshots, integrity hashes and resolved
+          # versions remain unchanged; the source lockfile is never edited.
+          python3 - "$RUNTIME_DIR/pnpm-lock.yaml" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          lockfile = Path(sys.argv[1])
+          content = lockfile.read_text(encoding="utf-8")
+          root = re.search(r"(?m)^  \.:\s*$", content)
+          first_workspace = re.search(r"(?m)^  packages/[^:\n]+:\s*$", content)
+          packages = re.search(r"(?m)^packages:\s*$", content)
+
+          if not root or not first_workspace or not packages:
+              raise SystemExit("Unexpected source pnpm-lock.yaml importer structure")
+          if not (root.start() < first_workspace.start() < packages.start()):
+              raise SystemExit("Root importer is not the first importer")
+
+          # Do not change dependency specifiers or their exact locked versions.
+          pruned = content[:first_workspace.start()] + "\n" + content[packages.start():]
+          lockfile.write_text(pruned, encoding="utf-8")
+          print("Temporary production lockfile retains only the root importer.")
+          PY
+
+          (
+            cd "$RUNTIME_DIR"
+            ACTUAL_NODE_LINKER="$(pnpm config get node-linker)"
+            echo "Runtime node linker: $ACTUAL_NODE_LINKER"
+            test "$ACTUAL_NODE_LINKER" = "hoisted"
+
+            # Frozen installation guarantees pnpm will not re-resolve versions.
+            pnpm install --prod --frozen-lockfile --ignore-scripts
+            test -d node_modules
+
+            # A .pnpm directory can exist even after a hoisted install.
+            # Require all packages outside it to be real directories (no links)
+            # before removing the unused virtual-store metadata from the ZIP.
+            if find node_modules -path 'node_modules/.pnpm' -prune -o -type l -print -quit | grep -q .; then
+              echo "::error::The production install has symlinks outside .pnpm."
+              find node_modules -path 'node_modules/.pnpm' -prune -o -type l -print
+              exit 1
+            fi
+            if [ -d node_modules/.pnpm ]; then
+              echo "Removing unused .pnpm directory from portable runtime dependencies."
+              rm -rf node_modules/.pnpm
+            fi
+
+            # Remove package-manager metadata and command shims not needed at runtime.
+            rm -rf node_modules/.bin
+            rm -f node_modules/.modules.yaml node_modules/.pnpm-workspace-state-v1.json
+
+            if find node_modules -type l -print -quit | grep -q .; then
+              echo "::error::The production node_modules unexpectedly contains symlinks."
+              find node_modules -type l -print
+              exit 1
+            fi
+
+            # Ensure we did not accidentally ship the workspace build tools.
+            for dev_package in vite vitest typescript eslint; do
+              if [ -e "node_modules/$dev_package" ]; then
+                echo "::error::Unexpected devDependency in portable runtime: $dev_package"
+                exit 1
+              fi
+            done
+
+            # Verify that direct dependencies and their transitive graph resolve
+            # without the stripped pnpm directory.
+            node --input-type=module -e "
+              import express from 'express';
+              import { WebSocketServer } from 'ws';
+              if (typeof express !== 'function' || typeof WebSocketServer !== 'function') {
+                throw new Error('Production dependency smoke test failed');
+              }
+              console.log('Production dependency smoke test passed');
+            "
+          )
+
+          rm -rf "$DIST_DIR/node_modules"
+          cp -a "$RUNTIME_DIR/node_modules" "$DIST_DIR/node_modules"
+
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+
+          const distDir = process.env.DIST_DIR;
+          const manifestPath = path.join(distDir, 'package.json');
+          if (!fs.existsSync(manifestPath)) {
+            throw new Error('The build output is missing ' + manifestPath);
+          }
+
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+          delete manifest.devDependencies;
+
+          const runtimeDependencies = {};
+          for (const section of ['dependencies', 'optionalDependencies']) {
+            const entries = manifest[section] || {};
+            for (const name of Object.keys(entries).sort()) {
+              const packageJsonPath = path.join(
+                distDir,
+                'node_modules',
+                ...name.split('/'),
+                'package.json'
+              );
+              if (!fs.existsSync(packageJsonPath)) {
+                if (section === 'optionalDependencies') continue;
+                throw new Error('Locked runtime dependency is missing: ' + name);
+              }
+              const installed = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+              entries[name] = installed.version;
+              runtimeDependencies[name] = installed.version;
+            }
+            manifest[section] = Object.fromEntries(
+              Object.entries(entries).sort(([a], [b]) => a.localeCompare(b))
+            );
+          }
+
+          if (Object.keys(runtimeDependencies).length === 0) {
+            throw new Error('No production dependencies were recorded.');
+          }
+
+          fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+
+          // Record every installed production package, including transitive dependencies.
+          const runtimePackages = [];
+          const nodeModulesDir = path.join(distDir, 'node_modules');
+
+          function collectPackage(packageDir) {
+            const packageJsonPath = path.join(packageDir, 'package.json');
+            if (!fs.existsSync(packageJsonPath)) return;
+
+            const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+            if (pkg.name && pkg.version) {
+              runtimePackages.push({
+                name: pkg.name,
+                version: pkg.version,
+                path: path.relative(nodeModulesDir, packageDir).split(path.sep).join('/')
+              });
+            }
+            collectNodeModules(path.join(packageDir, 'node_modules'));
+          }
+
+          function collectNodeModules(modulesDir) {
+            if (!fs.existsSync(modulesDir)) return;
+            const entries = fs.readdirSync(modulesDir, { withFileTypes: true })
+              .sort((a, b) => a.name.localeCompare(b.name));
+
+            for (const entry of entries) {
+              if (entry.name === '.bin') continue;
+              const entryPath = path.join(modulesDir, entry.name);
+              if (entry.isSymbolicLink()) {
+                throw new Error('Unexpected symlink in production node_modules: ' + entryPath);
+              }
+              if (!entry.isDirectory()) continue;
+
+              if (entry.name.startsWith('@')) {
+                const scopedEntries = fs.readdirSync(entryPath, { withFileTypes: true })
+                  .sort((a, b) => a.name.localeCompare(b.name));
+                for (const scopedEntry of scopedEntries) {
+                  const scopedPath = path.join(entryPath, scopedEntry.name);
+                  if (scopedEntry.isSymbolicLink()) {
+                    throw new Error('Unexpected symlink in production node_modules: ' + scopedPath);
+                  }
+                  if (scopedEntry.isDirectory()) collectPackage(scopedPath);
+                }
+              } else {
+                collectPackage(entryPath);
+              }
+            }
+          }
+
+          collectNodeModules(nodeModulesDir);
+          runtimePackages.sort((a, b) =>
+            a.name.localeCompare(b.name) ||
+            a.version.localeCompare(b.version) ||
+            a.path.localeCompare(b.path)
+          );
+
+          if (runtimePackages.length === 0) {
+            throw new Error('No installed production packages were inventoried.');
+          }
+
+          const provenance = {
+            schemaVersion: 2,
+            source: {
+              repository: process.env.GITHUB_REPOSITORY,
+              tag: process.env.SOURCE_TAG,
+              commit: process.env.SOURCE_COMMIT,
+              sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH)
+            },
+            workflow: {
+              ref: process.env.WORKFLOW_REF,
+              sha: process.env.WORKFLOW_SHA
+            },
+            lockfiles: {
+              pnpmLockSha256: process.env.LOCKFILE_SHA256,
+              pnpmWorkspaceSha256: process.env.WORKSPACE_SHA256
+            },
+            toolchain: {
+              node: process.version,
+              npm: execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim(),
+              pnpm: execFileSync('pnpm', ['--version'], { encoding: 'utf8' }).trim()
+            },
+            // Keep the stable runner label in the ZIP. Mutable hosted-image patch
+            // versions are deliberately excluded from the distributable metadata.
+            runner: {
+              os: process.env.RUNNER_OS || null
+            },
+            runtimeDependencies,
+            runtimePackages
+          };
+
+          fs.writeFileSync(
+            path.join(process.env.GITHUB_WORKSPACE, 'build-provenance.json'),
+            JSON.stringify(provenance, null, 2) + '\n'
+          );
+          console.log('Locked production dependencies:', runtimeDependencies);
+          console.log('Wrote build-provenance.json');
+          NODE
+
+          # Ensure the release build did not rewrite source manifests or lockfiles.
+          git diff --exit-code -- package.json pnpm-lock.yaml pnpm-workspace.yaml
       - name: Upload Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: NapCat.${{ matrix.target.name }}
           path: ${{ matrix.target.dist_dir }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # Upload traceability separately so its workflow SHA does not alter
+      # the distributable ZIP checksum when application files are unchanged.
+      - name: Upload Build Provenance
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat.${{ matrix.target.name }}.Provenance
+          path: build-provenance.json
+          if-no-files-found: error
+          retention-days: 30
 
   assemble-windows-node:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       # QQ 9.9.31.49738; SHA256 matches the microsoft/winget-pkgs installer manifest.
       QQ_URL: https://github.com/Rodert/qq-versions/releases/download/qq-packages-20260528-3e8913a2/QQ_9.9.31_260528_x64_01.exe
       QQ_SHA256: 0beb5cb4ff776cba822caa0abadbd53f5892f12628a86dabea1b372c82c086bc
       NODE_VERSION: '22.11.0'
+      NODE_SHA256: 905373a059aecaf7f48c1ce10ffbd5334457ca00f678747f19db5ea7d256c236
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ inputs.version }}
 
       - name: Download Artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           path: ./artifacts
 
       - name: Setup tools
         run: |
           sudo apt update
-          sudo apt install -y aria2 unzip zip p7zip-full curl jq
+          sudo apt install -y unzip p7zip-full curl
 
       - name: Generate download cache key
         id: download-cache-key
@@ -94,7 +379,7 @@ jobs:
 
       - name: Cache QQ and Node.js downloads
         id: cache-downloads
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: /tmp/napcat-downloads
           key: ${{ steps.download-cache-key.outputs.key }}
@@ -114,11 +399,14 @@ jobs:
 
           NODE_URL="https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-win-x64.zip"
           echo "Downloading Node.js $NODE_VERSION..."
-          aria2c -x1 -s1 -k1M -o "node-win-x64.zip" "$NODE_URL"
+          curl --fail --location --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 30 --max-time 600 \
+            --output "node-win-x64.zip" "$NODE_URL"
 
-      - name: Verify QQ installer
+      - name: Verify QQ and Node.js downloads
         run: |
           echo "$QQ_SHA256  /tmp/napcat-downloads/QQ_x64.exe" | sha256sum --check --strict -
+          echo "$NODE_SHA256  /tmp/napcat-downloads/node-win-x64.zip" | sha256sum --check --strict -
 
       - name: Assemble NapCat.Shell.Windows.Node.zip
         run: |
@@ -144,7 +432,7 @@ jobs:
           # 3) 创建输出目录
           # -----------------------------
           OUT_DIR="$GITHUB_WORKSPACE/NapCat.Shell.Windows.Node"
-          mkdir -p "$OUT_DIR/NapCat.Shell.Windows.Node"
+          mkdir -p "$OUT_DIR/napcat" "$OUT_DIR/win64"
 
           # -----------------------------
           # 4) 解压 NapCat.Shell.zip 到 napcat
@@ -167,97 +455,407 @@ jobs:
           # -----------------------------
           # 5.1) 拷贝 win64 目录下的文件
           # -----------------------------
-          mkdir -p "$OUT_DIR/win64"
-          find "$QQ_EXTRACT" -ipath "*/win64/SSOShareInfoHelper64.dll" -exec cp -a {} "$OUT_DIR/win64/" \; || true
-          find "$QQ_EXTRACT" -ipath "*/win64/parent-ipc-core-x64.dll" -exec cp -a {} "$OUT_DIR/win64/" \; || true
+          for name in "SSOShareInfoHelper64.dll" "parent-ipc-core-x64.dll"; do
+            source_file=$(find "$QQ_EXTRACT" -ipath "*/win64/$name" -type f -print -quit)
+            if [ -n "$source_file" ]; then
+              cp -a "$source_file" "$OUT_DIR/win64/"
+            else
+              echo "::warning::Optional QQ win64 file not found: $name"
+            fi
+          done
 
           # -----------------------------
           # 6) 拷贝仓库文件 napcat.bat 和 index.js
           # -----------------------------
-          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/napcat.bat" "$OUT_DIR/" || true
-          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/index.js" "$OUT_DIR/" || true
-          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/QQNT.dll" "$OUT_DIR/" || true
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/napcat.bat" "$OUT_DIR/"
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/index.js" "$OUT_DIR/"
+          cp -a "$GITHUB_WORKSPACE/packages/napcat-develop/QQNT.dll" "$OUT_DIR/"
 
           # -----------------------------
           # 7) 拷贝 Node.exe 到 NapCat.Shell.Windows.Node
           # -----------------------------
-          cp -a "$NODE_EXTRACT/node-v$NODE_VERSION-win-x64/node.exe" "$OUT_DIR/" || true
+          cp -a "$NODE_EXTRACT/node-v$NODE_VERSION-win-x64/node.exe" "$OUT_DIR/"
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
         with:
           name: NapCat.Shell.Windows.Node
           path: NapCat.Shell.Windows.Node
+          if-no-files-found: error
+          retention-days: 14
 
   validate-windows-node:
     needs: assemble-windows-node
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: ${{ inputs.version }}
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           name: NapCat.Shell.Windows.Node
           path: windows-node
 
-      - name: Verify bundled Node and QQ native dependencies
+      - name: Verify Windows Node package contents and runtime
         shell: pwsh
         working-directory: windows-node
         run: |
-          & .\node.exe --check .\index.js
+          $required = @(
+            "node.exe",
+            "index.js",
+            "napcat.bat",
+            "QQNT.dll",
+            "package.json",
+            "config.json",
+            "wrapper.node",
+            "napcat/napcat.mjs",
+            "napcat/NapCatWinBootHook.dll",
+            "napcat/loadNapCat.js"
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Required package file missing: $file"
+            }
+          }
+          $nodeVersion = (& .\\node.exe --version).Trim()
+          if ($nodeVersion -ne "v22.11.0") {
+            throw "Unexpected bundled Node.js version: $nodeVersion"
+          }
+          & .\\node.exe --check .\\index.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\node.exe -e "const wrapper = require('./wrapper.node'); if (!wrapper.NodeQQNTWrapperUtil) throw new Error('Missing NodeQQNTWrapperUtil'); console.log('wrapper.node native-load PASS'); process.exit(0);"
+          & .\\node.exe -e "const wrapper = require('./wrapper.node'); if (!wrapper.NodeQQNTWrapperUtil) throw new Error('Missing NodeQQNTWrapperUtil'); console.log('wrapper.node native-load PASS'); process.exit(0);"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Windows loader file queries
         shell: pwsh
         run: |
-          cmake -S .github/tests/windows-loader -B "$env:RUNNER_TEMP/windows-loader-test" -A x64
+          $ErrorActionPreference = "Stop"
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "Windows validation OS: $($os.Caption), build $($os.BuildNumber)"
+          # FileStatBasicByNameInfo requires the newer Windows file-stat API.
+          # Keep the Windows validation host pinned to the 26100+ family.
+          if ([int]$os.BuildNumber -lt 26100) {
+            throw "Windows loader test requires build 26100 or newer; got $($os.BuildNumber)"
+          }
+          $buildDir = Join-Path $env:RUNNER_TEMP "windows-loader-test"
+          cmake -S .github/tests/windows-loader -B $buildDir -A x64
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cmake --build "$env:RUNNER_TEMP/windows-loader-test" --config Release
+          cmake --build $buildDir --config Release
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:RUNNER_TEMP/windows-loader-test/Release/windows-loader-test.exe" "$pwd/windows-node/napcat/NapCatWinBootHook.dll" "$pwd/windows-node/napcat/loadNapCat.js"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $probe = Join-Path $buildDir "Release/windows-loader-test.exe"
+          $hookDll = (Resolve-Path "windows-node/napcat/NapCatWinBootHook.dll").Path
+          $loaderJs = (Resolve-Path "windows-node/napcat/loadNapCat.js").Path
+          Write-Host "Testing Windows loader: $hookDll"
+          Write-Host "Loader script: $loaderJs"
+          & $probe $hookDll $loaderJs
+          $probeExitCode = $LASTEXITCODE
+          Write-Host "Windows loader probe exit code: $probeExitCode"
+          if ($probeExitCode -ne 0) { exit $probeExitCode }
 
   release-napcat:
     needs: [build, assemble-windows-node, validate-windows-node]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      TZ: UTC
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+      WORKFLOW_REF: ${{ github.workflow_ref }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout source tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
+          ref: ${{ inputs.version }}
           fetch-depth: 0
 
       - name: Download Artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
         with:
           path: ./artifacts
 
-      - name: Download NapCat.Shell.Windows.OneKey.zip
-        run: |
-            curl -L -o NapCat.Shell.Windows.OneKey.zip https://github.com/NapNeko/NapCatResource/raw/main/NapCat.Shell.Windows.OneKey.zip
-
-      - name: Zip Artifacts
-        run: |
-            cd artifacts
-            [ -d NapCat.Framework ] && (cd NapCat.Framework && zip -qr ../../NapCat.Framework.zip .)
-            [ -d NapCat.Shell ] && (cd NapCat.Shell && zip -qr ../../NapCat.Shell.zip .)
-            [ -d NapCat.Shell.Windows.Node ] && (cd NapCat.Shell.Windows.Node && zip -qr ../../NapCat.Shell.Windows.Node.zip .)
-            cd ..
-
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v6
+      - name: Use fixed release packaging toolchain
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
-          node-version: 20.x
+          node-version: 20.19.5
+      - name: Set up Python for deterministic ZIP packaging
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12.8'
+          check-latest: false
+
+      - name: Resolve source commit and archive timestamp
+        id: source
+        env:
+          SOURCE_TAG: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_COMMIT="$(git rev-parse "$SOURCE_TAG^{commit}")"
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_COMMIT")"
+          echo "source_commit=$SOURCE_COMMIT" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$SOURCE_DATE_EPOCH" >> "$GITHUB_OUTPUT"
+
+      - name: Create reproducible ZIPs, checksums, and provenance
+        env:
+          SOURCE_TAG: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ steps.source.outputs.source_commit }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          import platform
+          import stat
+          import zipfile
+          import zlib
+          from pathlib import Path
+
+          source_epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          utc_time = datetime.datetime.fromtimestamp(source_epoch, datetime.timezone.utc)
+          if utc_time.year < 1980 or utc_time.year > 2107:
+              raise SystemExit("SOURCE_DATE_EPOCH is outside the ZIP timestamp range")
+          dos_time = (
+              utc_time.year,
+              utc_time.month,
+              utc_time.day,
+              utc_time.hour,
+              utc_time.minute,
+              utc_time.second - (utc_time.second % 2)
+          )
+
+          builds = {}
+          expected_commit = os.environ["SOURCE_COMMIT"]
+          expected_tag = os.environ["SOURCE_TAG"]
+          expected_workflow_sha = os.environ["WORKFLOW_SHA"]
+
+          for artifact_name in ("NapCat.Framework", "NapCat.Shell"):
+              provenance_path = (
+                  Path("artifacts") / (artifact_name + ".Provenance") /
+                  "build-provenance.json"
+              )
+              if (Path("artifacts") / artifact_name / "build-provenance.json").exists():
+                  raise SystemExit(f"Build provenance leaked into the {artifact_name} ZIP")
+              if not provenance_path.is_file():
+                  raise SystemExit(f"Missing build provenance: {provenance_path}")
+              data = json.loads(provenance_path.read_text(encoding="utf-8"))
+              if data["source"]["commit"] != expected_commit:
+                  raise SystemExit(f"{artifact_name} was built from a different source commit")
+              if data["source"]["tag"] != expected_tag:
+                  raise SystemExit(f"{artifact_name} was built from a different source tag")
+              if data["workflow"]["sha"] != expected_workflow_sha:
+                  raise SystemExit(f"{artifact_name} used a different workflow commit")
+              builds[artifact_name] = data
+
+          comparison_fields = (
+              "lockfiles",
+              "toolchain",
+              "runner",
+              "runtimeDependencies",
+              "runtimePackages"
+          )
+          for field in comparison_fields:
+              if builds["NapCat.Framework"][field] != builds["NapCat.Shell"][field]:
+                  raise SystemExit(
+                      f"Framework and Shell build environments/dependencies differ in {field}"
+                  )
+
+          # Regression check for the known v4.18.42 source-lockfile versions.
+          if expected_tag == "v4.18.42":
+              expected_runtime = {
+                  "express": "5.1.0",
+                  "ws": "8.18.3",
+                  "encodeurl": "2.0.0"
+              }
+              installed = {}
+              for item in builds["NapCat.Framework"]["runtimePackages"]:
+                  installed.setdefault(item["name"], set()).add(item["version"])
+              for package_name, expected_version in expected_runtime.items():
+                  actual_versions = installed.get(package_name, set())
+                  if actual_versions != {expected_version}:
+                      raise SystemExit(
+                          f"v4.18.42 expected {package_name}@{expected_version}, "
+                          f"found {sorted(actual_versions)}"
+                      )
+
+          def make_zip_info(name, mode, compression):
+              info = zipfile.ZipInfo(name, date_time=dos_time)
+              info.create_system = 3
+              info.external_attr = (mode & 0xFFFF) << 16
+              info.internal_attr = 0
+              info.flag_bits = 0
+              info.extra = b""
+              info.comment = b""
+              info.compress_type = compression
+              return info
+
+          def create_reproducible_zip(source_dir, output_file):
+              root = Path(source_dir)
+              if not root.is_dir():
+                  raise SystemExit(f"Missing artifact directory: {root}")
+
+              entries = sorted(
+                  root.rglob("*"),
+                  key=lambda item: item.relative_to(root).as_posix()
+              )
+              with zipfile.ZipFile(
+                  output_file,
+                  "w",
+                  compression=zipfile.ZIP_DEFLATED,
+                  compresslevel=9,
+                  allowZip64=True,
+                  strict_timestamps=True
+              ) as archive:
+                  archive.comment = b""
+                  for item in entries:
+                      relative = item.relative_to(root).as_posix()
+                      item_stat = item.lstat()
+
+                      if stat.S_ISLNK(item_stat.st_mode):
+                          link_target = os.readlink(item).encode("utf-8")
+                          info = make_zip_info(relative, stat.S_IFLNK | 0o777, zipfile.ZIP_STORED)
+                          archive.writestr(info, link_target)
+                      elif stat.S_ISDIR(item_stat.st_mode):
+                          info = make_zip_info(relative + "/", stat.S_IFDIR | 0o755, zipfile.ZIP_STORED)
+                          archive.writestr(info, b"")
+                      elif stat.S_ISREG(item_stat.st_mode):
+                          executable = bool(item_stat.st_mode & stat.S_IXUSR)
+                          mode = stat.S_IFREG | (0o755 if executable else 0o644)
+                          info = make_zip_info(relative, mode, zipfile.ZIP_DEFLATED)
+                          archive.writestr(info, item.read_bytes(), compresslevel=9)
+                      else:
+                          raise SystemExit(f"Unsupported filesystem entry: {item}")
+
+              return {
+                  "sha256": hashlib.sha256(Path(output_file).read_bytes()).hexdigest(),
+                  "sizeBytes": Path(output_file).stat().st_size
+              }
+
+          archives = {
+              "NapCat.Framework": "NapCat.Framework.zip",
+              "NapCat.Shell": "NapCat.Shell.zip",
+              "NapCat.Shell.Windows.Node": "NapCat.Shell.Windows.Node.zip"
+          }
+          artifact_hashes = {}
+          package_file_lines = []
+          package_file_counts = {}
+
+          def append_package_file_hashes(source_dir, artifact_name):
+              root = Path("artifacts") / source_dir
+              if not root.is_dir():
+                  raise SystemExit(f"Missing artifact directory: {root}")
+
+              count = 0
+              entries = sorted(
+                  root.rglob("*"),
+                  key=lambda item: item.relative_to(root).as_posix()
+              )
+              for item in entries:
+                  item_stat = item.lstat()
+                  if stat.S_ISDIR(item_stat.st_mode):
+                      continue
+                  if stat.S_ISLNK(item_stat.st_mode):
+                      payload = b"SYMLINK\0" + os.readlink(item).encode("utf-8")
+                  elif stat.S_ISREG(item_stat.st_mode):
+                      payload = item.read_bytes()
+                  else:
+                      raise SystemExit(f"Unsupported filesystem entry: {item}")
+
+                  relative = item.relative_to(root).as_posix()
+                  digest = hashlib.sha256(payload).hexdigest()
+                  package_file_lines.append(f"{digest}  {artifact_name}/{relative}")
+                  count += 1
+
+              return count
+
+          for source_dir, output_file in archives.items():
+              source_path = Path("artifacts") / source_dir
+              artifact_hashes[output_file] = create_reproducible_zip(
+                  source_path,
+                  output_file
+              )
+              package_file_counts[source_dir] = append_package_file_hashes(
+                  source_dir,
+                  source_dir
+              )
+
+          Path("PACKAGE-FILES-SHA256SUMS.txt").write_text(
+              "\n".join(package_file_lines) + "\n",
+              encoding="utf-8"
+          )
+
+          build = builds["NapCat.Framework"]
+          release_provenance = {
+              "schemaVersion": 1,
+              "source": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "tag": expected_tag,
+                  "commit": expected_commit,
+                  "sourceDateEpoch": source_epoch
+              },
+              "workflow": {
+                  "ref": os.environ["WORKFLOW_REF"],
+                  "sha": expected_workflow_sha
+              },
+              "lockfiles": build["lockfiles"],
+              "toolchain": build["toolchain"],
+              "runner": build["runner"],
+              "runtimeDependencies": build["runtimeDependencies"],
+              "archiveToolchain": {
+                  "python": platform.python_version(),
+                  "zlibCompileVersion": zlib.ZLIB_VERSION,
+                  "zlibRuntimeVersion": zlib.ZLIB_RUNTIME_VERSION,
+                  "compression": "ZIP_DEFLATED",
+                  "compressionLevel": 9,
+                  "entryOrdering": "ascending POSIX relative path",
+                  "entryTimestamp": "source Git commit timestamp in UTC"
+              },
+              "artifacts": artifact_hashes,
+              "packageFiles": package_file_counts
+          }
+          Path("BUILD-PROVENANCE.json").write_text(
+              json.dumps(release_provenance, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8"
+          )
+
+          checksum_lines = []
+          for filename in sorted(list(archives.values()) + ["BUILD-PROVENANCE.json", "PACKAGE-FILES-SHA256SUMS.txt"]):
+              digest = hashlib.sha256(Path(filename).read_bytes()).hexdigest()
+              checksum_lines.append(f"{digest}  {filename}")
+          Path("SHA256SUMS.txt").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+
+          print(json.dumps(release_provenance, indent=2, sort_keys=True))
+          PY
+
+      - name: Upload release candidate (no Release is published in dry-run mode)
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat.Release-Candidate-${{ inputs.version }}
+          path: |
+            NapCat.Framework.zip
+            NapCat.Shell.zip
+            NapCat.Shell.Windows.Node.zip
+            SHA256SUMS.txt
+            BUILD-PROVENANCE.json
+            PACKAGE-FILES-SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Generate release note
+        if: ${{ inputs.publish_release }}
         env:
           CURRENT_TAG: ${{ inputs.version }}
         run: node .github/scripts/generate-release-notes.mjs "$CURRENT_TAG" "$GITHUB_REPOSITORY" CHANGELOG.md
 
       - name: Create Release and Upload Artifacts
-        uses: softprops/action-gh-release@v2
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
         with:
           tag_name: ${{ inputs.version }}
           name: NapCat ${{ inputs.version }}
@@ -266,76 +864,7 @@ jobs:
             NapCat.Shell.Windows.Node.zip
             NapCat.Framework.zip
             NapCat.Shell.zip
-            NapCat.Shell.Windows.OneKey.zip
+            SHA256SUMS.txt
+            BUILD-PROVENANCE.json
+            PACKAGE-FILES-SHA256SUMS.txt
           draft: false
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9
-          run_install: false
-
-      - name: Update apifox
-        env:
-          APIFOX_TOKEN: ${{ secrets.APIFOX_TOKEN }}
-        run: |
-          pnpm i --ignore-scripts
-          pnpm run build:openapi
-
-          jq -n --rawfile input packages/napcat-schema/dist/openapi.json \
-          '{
-              input: $input,
-              options: {
-                  "endpointOverwriteBehavior": "OVERWRITE_EXISTING",
-                  "schemaOverwriteBehavior": "OVERWRITE_EXISTING",
-                  "updateFolderOfChangedEndpoint": true,
-                  "moduleId": 1140714,
-                  "deleteUnmatchedResources": true
-              }
-          }' > apifox_payload.json
-
-          curl --location -g --request POST 'https://api.apifox.com/v1/projects/5348325/import-openapi?locale=zh-CN' \
-          --header 'X-Apifox-Api-Version: 2024-03-28' \
-          --header "Authorization: Bearer $APIFOX_TOKEN" \
-          --header 'Content-Type: application/json' \
-          --data-binary @apifox_payload.json
-
-      - name: Publish release hash
-        env:
-          GH_TOKEN: ${{ secrets.NAPCAT_BUILD }}
-        run: |
-          set -euo pipefail
-          VERSION="${{ inputs.version }}"
-          HASH_REPO="NapNeko/napcat-release-hash"
-
-          gh auth setup-git
-          gh repo clone "$HASH_REPO" hash-repo
-
-          node .github/scripts/publish-release-hash.mjs \
-            --version    "$VERSION" \
-            --shell      "./artifacts/NapCat.Shell/napcat.mjs" \
-            --framework  "./artifacts/NapCat.Framework/napcat.mjs" \
-            --file       "./hash-repo/release.json"
-
-          cd hash-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add release.json
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "chore: update release hash for ${VERSION}"
-            git push origin HEAD:main || git push origin HEAD:master
-          fi
-
-      - name: Trigger downstream release workflows
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ inputs.version }}
-        run: |
-          echo "Triggering release-downstream workflow with tag_name=${VERSION}"
-          curl -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/release-downstream.yml/dispatches \
-            -d "{\"ref\":\"main\",\"inputs\":{\"tag_name\":\"${VERSION}\"}}"

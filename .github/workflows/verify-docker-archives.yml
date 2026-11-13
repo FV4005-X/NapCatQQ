@@ -1,0 +1,296 @@
+name: Verify archived Docker images against Docker Hub
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/verify-docker-archives.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify archived v4.18.42 ${{ matrix.arch }} image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Download and verify historical Docker archive
+        id: archive
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/napcat-docker-check"
+          mkdir -p "$work"
+          cd "$work"
+
+          archive="napcat-docker-v4.18.42-$ARCH.tar"
+          sidecar="$archive.sha256"
+
+          curl -fL --retry 3 --retry-all-errors -o "$archive" \
+            "https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/$archive"
+          curl -fL --retry 3 --retry-all-errors -o "$sidecar" \
+            "https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/$sidecar"
+
+          actual_sha="$(sha256sum "$archive" | awk '{print $1}')"
+          sidecar_sha="$(awk 'NR==1 {print $1}' "$sidecar")"
+
+          case "$ARCH" in
+            amd64)
+              expected_sha="85e3fd02b58fd836a0177734b6ff77a896000bcfcf209b3b200d7e8b8452df7c"
+              expected_size="612216320"
+              ;;
+            arm64)
+              expected_sha="0d14594844e9135c760e710754a8778d98649de2ca837fce5a61b69b7d39954d"
+              expected_size="597573632"
+              ;;
+          esac
+
+          api_digest="$(curl -fsSL --retry 3 \
+            https://api.github.com/repos/XingYunStar/NapCatQQ/releases/tags/v4.18.42 \
+            | jq -er --arg name "$archive" '.assets[] | select(.name==$name) | .digest')"
+          actual_size="$(stat -c '%s' "$archive")"
+
+          echo "Archive: $archive"
+          echo "Actual SHA256: $actual_sha"
+          echo "Sidecar SHA256: $sidecar_sha"
+          echo "GitHub Release API digest: $api_digest"
+          echo "Size: $actual_size bytes"
+
+          test "$actual_sha" = "$expected_sha"
+          test "$sidecar_sha" = "$expected_sha"
+          test "$api_digest" = "sha256:$expected_sha"
+          test "$actual_size" = "$expected_size"
+
+          echo "archive_path=$work/$archive" >> "$GITHUB_OUTPUT"
+          echo "archive_sha256=$actual_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect Docker archive config and layer DiffIDs
+        id: inspect
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive_path }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          python3 - "$ARCHIVE" "$ARCH" "$GITHUB_OUTPUT" <<'PY'
+          import hashlib
+          import json
+          import sys
+          import tarfile
+
+          archive, expected_arch, output_path = sys.argv[1:]
+
+          with tarfile.open(archive, "r:*") as tf:
+              manifest_file = tf.extractfile("manifest.json")
+              if manifest_file is None:
+                  raise SystemExit("Docker archive has no manifest.json")
+              manifests = json.load(manifest_file)
+              if len(manifests) != 1:
+                  raise SystemExit(f"Expected one image in archive, found {len(manifests)}")
+
+              item = manifests[0]
+              config_stream = tf.extractfile(item["Config"])
+              if config_stream is None:
+                  raise SystemExit("Docker archive config file is missing")
+              config_bytes = config_stream.read()
+              config_digest = "sha256:" + hashlib.sha256(config_bytes).hexdigest()
+              config = json.loads(config_bytes)
+
+              architecture = config.get("architecture")
+              operating_system = config.get("os")
+              if architecture != expected_arch or operating_system != "linux":
+                  raise SystemExit(
+                      f"Wrong image platform: {operating_system}/{architecture}; "
+                      f"expected linux/{expected_arch}"
+                  )
+
+              diff_ids = config.get("rootfs", {}).get("diff_ids", [])
+              layer_paths = item.get("Layers", [])
+              if len(layer_paths) != len(diff_ids):
+                  raise SystemExit(
+                      f"Archive layer count {len(layer_paths)} != config DiffID count {len(diff_ids)}"
+                  )
+
+              for layer_path in layer_paths:
+                  try:
+                      tf.getmember(layer_path)
+                  except KeyError:
+                      raise SystemExit(f"Missing layer archive member: {layer_path}")
+
+              history = config.get("history", [])
+              print(f"Archive image ID/config digest: {config_digest}")
+              print(f"Platform: {operating_system}/{architecture}")
+              print(f"Filesystem layers: {len(diff_ids)}")
+              print(f"History entries: {len(history)}")
+              print(f"RepoTags in archive: {item.get('RepoTags', [])}")
+
+              with open(output_path, "a", encoding="utf-8") as output:
+                  output.write(f"config_digest={config_digest}\n")
+                  output.write(f"layer_count={len(diff_ids)}\n")
+                  output.write(f"history_count={len(history)}\n")
+          PY
+
+      - name: Load archived image and validate its config and RootFS DiffIDs
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.archive.outputs.archive_path }}
+          ARCH: ${{ matrix.arch }}
+          CONFIG_DIGEST: ${{ steps.inspect.outputs.config_digest }}
+        run: |
+          set -euo pipefail
+          docker load --input "$ARCHIVE"
+          docker image tag "$CONFIG_DIGEST" "napcat-archive-check:$ARCH"
+
+          python3 - "$ARCHIVE" "$CONFIG_DIGEST" "$ARCH" <<'PY'
+          import json
+          import subprocess
+          import sys
+          import tarfile
+
+          archive, expected_id, expected_arch = sys.argv[1:]
+
+          with tarfile.open(archive, "r:*") as tf:
+              item = json.load(tf.extractfile("manifest.json"))[0]
+              config = json.load(tf.extractfile(item["Config"]))
+
+          raw = subprocess.check_output(
+              ["docker", "image", "inspect", "napcat-archive-check:" + expected_arch],
+              text=True,
+          )
+          image = json.loads(raw)[0]
+          expected_diff_ids = config.get("rootfs", {}).get("diff_ids", [])
+
+          if image["Id"] != expected_id:
+              raise SystemExit(f"Loaded image ID mismatch: {image['Id']} != {expected_id}")
+          if image["Os"] != "linux" or image["Architecture"] != expected_arch:
+              raise SystemExit(
+                  f"Loaded image platform mismatch: {image['Os']}/{image['Architecture']}"
+              )
+          if image["RootFS"]["Layers"] != expected_diff_ids:
+              raise SystemExit("Docker Engine loaded RootFS DiffIDs differ from the archive config")
+
+          print(f"PASS: Docker Engine loaded {image['Id']} as linux/{expected_arch}")
+          print(f"RootFS DiffIDs verified: {len(expected_diff_ids)}")
+          PY
+
+      - name: Cross-check amd64 archive against the Huawei mirror of the Hub image
+        if: matrix.arch == 'amd64'
+        shell: bash
+        env:
+          CONFIG_DIGEST: ${{ steps.inspect.outputs.config_digest }}
+        run: |
+          set -euo pipefail
+          mirror_ref="swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/mlikiowa/napcat-docker:v4.18.42"
+
+          docker buildx imagetools inspect --raw "$mirror_ref" > "$RUNNER_TEMP/mirror-manifest.json"
+          mirror_manifest_digest="sha256:$(sha256sum "$RUNNER_TEMP/mirror-manifest.json" | awk '{print $1}')"
+          mirror_config_digest="$(jq -er '.config.digest' "$RUNNER_TEMP/mirror-manifest.json")"
+
+          echo "Huawei mirror manifest digest: $mirror_manifest_digest"
+          echo "Huawei mirror image config digest: $mirror_config_digest"
+          echo "Docker Hub v4.18.42 multi-platform index digest (published on Hub): sha256:696e9574a0f6fb2f86cbecba8a32048f2a5823117dc9b13c6c02637ad890fa8b"
+          echo "Docker Hub linux/amd64 manifest digest (published on Hub): sha256:6c1b1a2736588060f484ea273a190309bdeca32c15d6a9c61325d3499ee091fa"
+
+          test "$mirror_config_digest" = "$CONFIG_DIGEST"
+          docker pull --platform linux/amd64 "$mirror_ref"
+
+          python3 - "$CONFIG_DIGEST" "$mirror_ref" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          expected_config, mirror_ref = sys.argv[1:]
+
+          def inspect(ref):
+              raw = subprocess.check_output(["docker", "image", "inspect", ref], text=True)
+              return json.loads(raw)[0]
+
+          archive = inspect("napcat-archive-check:amd64")
+          mirror = inspect(mirror_ref)
+
+          for field in ("Id", "Os", "Architecture", "RootFS", "Config"):
+              if archive.get(field) != mirror.get(field):
+                  raise SystemExit(
+                      f"{field} mismatch:\narchive={archive.get(field)!r}\nmirror={mirror.get(field)!r}"
+                  )
+
+          if archive["Id"] != expected_config:
+              raise SystemExit("Archive image ID differs from the mirror config digest")
+
+          print("PASS: amd64 archive and Huawei mirror have identical image config and ordered RootFS DiffIDs.")
+          print(f"Image ID: {archive['Id']}")
+          print(f"Filesystem layers: {len(archive['RootFS']['Layers'])}")
+          PY
+
+      - name: Cross-check arm64 archive against a public mirror of the Hub image
+        if: matrix.arch == 'arm64'
+        shell: bash
+        env:
+          CONFIG_DIGEST: ${{ steps.inspect.outputs.config_digest }}
+        run: |
+          set -euo pipefail
+          google_ref="mirror.gcr.io/mlikiowa/napcat-docker:v4.18.42"
+          dao_ref="docker.m.daocloud.io/mlikiowa/napcat-docker:v4.18.42"
+          selected_ref=""
+          manifest="$RUNNER_TEMP/arm64-mirror-manifest.json"
+
+          if docker buildx imagetools inspect --raw "$google_ref" > "$manifest" 2>/dev/null; then
+            selected_ref="$google_ref"
+            echo "Using Google mirror: $selected_ref"
+          elif docker buildx imagetools inspect --raw "$dao_ref" > "$manifest" 2>/dev/null; then
+            selected_ref="$dao_ref"
+            echo "Using DaoCloud mirror: $selected_ref"
+          else
+            echo "::warning::No public mirror was accessible; direct Hub arm64 comparison remains unverified."
+            exit 0
+          fi
+
+          mirror_digest="sha256:$(sha256sum "$manifest" | awk '{print $1}')"
+          echo "Mirror manifest/index digest: $mirror_digest"
+
+          if jq -e 'has("manifests")' "$manifest" >/dev/null; then
+            arm64_digest="$(jq -er '.manifests[] | select(.platform.os=="linux" and .platform.architecture=="arm64") | .digest' "$manifest")"
+            echo "Mirror linux/arm64 manifest digest: $arm64_digest"
+          else
+            mirror_config="$(jq -er '.config.digest' "$manifest")"
+            echo "Mirror image config digest: $mirror_config"
+            test "$mirror_config" = "$CONFIG_DIGEST"
+          fi
+
+          docker pull --platform linux/arm64 "$selected_ref"
+
+          python3 - "$CONFIG_DIGEST" "$selected_ref" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          expected_config, mirror_ref = sys.argv[1:]
+
+          def inspect(ref):
+              raw = subprocess.check_output(["docker", "image", "inspect", ref], text=True)
+              return json.loads(raw)[0]
+
+          archive = inspect("napcat-archive-check:arm64")
+          mirror = inspect(mirror_ref)
+
+          for field in ("Id", "Os", "Architecture", "RootFS", "Config"):
+              if archive.get(field) != mirror.get(field):
+                  raise SystemExit(
+                      f"{field} mismatch:\\narchive={archive.get(field)!r}\\nmirror={mirror.get(field)!r}"
+                  )
+
+          if archive["Id"] != expected_config:
+              raise SystemExit("Archive image ID differs from mirror config digest")
+
+          print("PASS: arm64 archive and mirror have identical image config and ordered RootFS DiffIDs.")
+          print(f"Image ID: {archive['Id']}")
+          print(f"Filesystem layers: {len(archive['RootFS']['Layers'])}")
+          PY

@@ -1,0 +1,165 @@
+name: Historical v4.18.42 runtime replay (no publish)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/replay-historical-release.yml
+      - .github/scripts/replay-historical-zip-metadata.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  historical-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout analysis scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Checkout original v4.18.42 source manifest
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: v4.18.42
+          path: original_source
+
+      - name: Download previously verified v4.18.42 compiled artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: NapCat.Release-Candidate-v4.18.42
+          run-id: 43281514637
+          github-token: ${{ github.token }}
+          path: baseline_zips
+
+      - name: Configure original-era Node/npm
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 20.19.5
+
+      - name: Check source commit and local toolchain
+        run: |
+          set -euo pipefail
+          test "$(git -C original_source rev-parse HEAD)" = "9335843246e3b7a17944861f3ac8731a259732c2"
+          test "$(node -v)" = "v20.19.5"
+          test "$(npm -v)" = "10.8.2"
+          (cd baseline_zips && sha256sum --check --strict SHA256SUMS.txt)
+
+      - name: Assemble historical npm runtime without copying any upstream ZIP files
+        env:
+          NPM_CONFIG_CACHE: ${{ runner.temp }}/historical-npm-cache
+        run: |
+          set -euo pipefail
+          mkdir -p replay_framework replay_shell replay_windows replay_zips
+          unzip -q baseline_zips/NapCat.Framework.zip -d replay_framework
+          unzip -q baseline_zips/NapCat.Shell.zip -d replay_shell
+          unzip -q baseline_zips/NapCat.Shell.Windows.Node.zip -d replay_windows
+
+          # Original workflow executed 'npm pkg delete devDependencies'
+          # followed by 'npm install --omit=dev'. Use npm's historical
+          # registry cutoff to reproduce the resolution date of Oct 30 2026.
+          for directory in replay_framework replay_shell; do
+            rm -rf "$directory/node_modules"
+            rm -f "$directory/build-provenance.json"
+            cp original_source/package.json "$directory/package.json"
+            (
+              cd "$directory"
+              npm pkg delete devDependencies
+              npm install --omit=dev --before=2026-10-30T07:03:00Z --no-audit --no-fund
+              rm -f package-lock.json
+              node -e "for (const name of ['express','ws','encodeurl']) {const fs=require('fs');const p=require('path');const item=p.join('node_modules',name,'package.json');if (fs.existsSync(item)) console.log(name,JSON.parse(fs.readFileSync(item)).version)}"
+            )
+          done
+
+          rm -rf replay_windows/napcat/node_modules
+          rm -f replay_windows/napcat/build-provenance.json
+          cp -a replay_shell/node_modules replay_windows/napcat/node_modules
+          cp replay_shell/package.json replay_windows/napcat/package.json
+
+          # Mirror the upstream zip command as a baseline. This experiment
+          # deliberately does not force the historical per-file timestamps yet.
+          (cd replay_framework && zip -qr ../replay_zips/NapCat.Framework.zip .)
+          (cd replay_shell && zip -qr ../replay_zips/NapCat.Shell.zip .)
+          (cd replay_windows && zip -qr ../replay_zips/NapCat.Shell.Windows.Node.zip .)
+
+      - name: Download official historical assets from XingYunStar preservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p official_zips
+          download() {
+            local filename="$1"
+            local sha="$2"
+            local url="https://github.com/XingYunStar/NapCatQQ/releases/download/v4.18.42/$filename"
+            if ! curl -fL --retry 5 --retry-all-errors --retry-delay 3 --max-time 1200 --output "official_zips/$filename" "$url"; then
+              rm -f "official_zips/$filename"
+              gh release download v4.18.42 --repo XingYunStar/NapCatQQ --pattern "$filename" --dir official_zips --clobber
+            fi
+            printf '%s  official_zips/%s\n' "$sha" "$filename" | sha256sum --check --strict -
+          }
+          download NapCat.Framework.zip 118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e
+          download NapCat.Shell.zip 02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d
+          download NapCat.Shell.Windows.Node.zip 77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed
+
+      - name: Compare reconstructed runtime and original byte contents
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/compare-release-assets.py \
+            --ours-dir replay_zips \
+            --third-party-dir official_zips \
+            --output-dir historical_comparison
+          cat historical_comparison/COMPARISON.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attempt byte-exact historical ZIP reassembly
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/replay-historical-zip-metadata.py \
+            --official-dir official_zips \
+            --output-dir historical_exact_replay
+          echo '### Historical ZIP SHA256 reconstruction results' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat historical_exact_replay/RESULTS.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Gate byte-exact artifacts on all three official SHA256 values
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("historical_exact_replay/RESULTS.json").read_text())
+          if len(report) != 3:
+              raise SystemExit("Unexpected number of release archives")
+          for name, item in report.items():
+              if not item["identical"]:
+                  raise SystemExit("Historical SHA256 mismatch: " + name)
+              print(name, item["reconstructed_sha256"], "PASS")
+          PY
+
+      - name: Upload byte-exact historical ZIPs as dry-run artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat-v4.18.42-Historical-Byte-Exact-Release-Candidate
+          path: |
+            historical_exact_replay/NapCat.Framework.zip
+            historical_exact_replay/NapCat.Shell.zip
+            historical_exact_replay/NapCat.Shell.Windows.Node.zip
+            historical_exact_replay/RESULTS.json
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload text-only historical reproduction diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: NapCat-v4.18.42-original-npm-replay-comparison
+          path: |
+            historical_comparison/
+            historical_exact_replay/RESULTS.json
+          if-no-files-found: warn
+          retention-days: 30

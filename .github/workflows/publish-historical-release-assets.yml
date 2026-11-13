@@ -1,0 +1,167 @@
+name: Publish byte-exact historical v4.18.42 assets
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-historical-release-assets.yml
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Replace the three v4.18.42 ZIP assets after all checks pass"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    # The push trigger is intentionally one-shot: only the commit that adds
+    # this workflow may publish. Later edits require an explicit dispatch.
+    if: >-
+      (github.event_name == 'push' &&
+       github.event.head_commit.message == 'release: publish v4.18.42 byte-exact historical assets')
+      ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: v4.18.42
+      SOURCE_COMMIT: 9335843246e3b7a17944861f3ac8731a259732c2
+      HISTORICAL_RUN_ID: "43289849882"
+    steps:
+      - name: Checkout and verify the immutable release source tag
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: v4.18.42
+          fetch-depth: 0
+
+      - name: Download independently reconstructed byte-exact ZIPs
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131
+        with:
+          name: NapCat-v4.18.42-Historical-Byte-Exact-Release-Candidate
+          run-id: 43289849882
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: historical-release
+
+      - name: Verify source, artifact contents, and expected SHA256 values
+        shell: bash
+        working-directory: historical-release
+        run: |
+          set -euo pipefail
+          actual_commit="$(git -C "$GITHUB_WORKSPACE" rev-parse 'v4.18.42^{commit}')"
+          test "$actual_commit" = "$SOURCE_COMMIT"
+
+          test -f NapCat.Framework.zip
+          test -f NapCat.Shell.zip
+          test -f NapCat.Shell.Windows.Node.zip
+          test -f RESULTS.json
+
+          printf '%s  %s\n' \
+            '118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e' NapCat.Framework.zip \
+            '02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d' NapCat.Shell.zip \
+            '77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed' NapCat.Shell.Windows.Node.zip \
+            | sha256sum --check --strict -
+
+          test "$(stat -c '%s' NapCat.Framework.zip)" = "36823348"
+          test "$(stat -c '%s' NapCat.Shell.zip)" = "35967555"
+          test "$(stat -c '%s' NapCat.Shell.Windows.Node.zip)" = "124162399"
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          results = json.loads(Path("RESULTS.json").read_text(encoding="utf-8"))
+          expected = {
+              "NapCat.Framework.zip": "118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e",
+              "NapCat.Shell.zip": "02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d",
+              "NapCat.Shell.Windows.Node.zip": "77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed",
+          }
+          if set(results) != set(expected):
+              raise SystemExit("Unexpected archive set in historical replay report")
+          for name, digest in expected.items():
+              record = results[name]
+              if not record.get("identical") or record.get("reconstructed_sha256") != digest:
+                  raise SystemExit(f"Historical replay report does not verify {name}")
+              if record.get("original_sha256") != digest:
+                  raise SystemExit(f"Historical reference digest mismatch for {name}")
+          print("Historical replay report: all three archives independently verified.")
+          PY
+
+          cat > SHA256SUMS.txt <<'EOF'
+          118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e  NapCat.Framework.zip
+          02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d  NapCat.Shell.zip
+          77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed  NapCat.Shell.Windows.Node.zip
+          EOF
+          sha256sum --check --strict SHA256SUMS.txt
+
+      - name: Snapshot the existing Release without changing it
+        id: release_before
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release-before.json"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and .prerelease == false' \
+            "$RUNNER_TEMP/release-before.json" >/dev/null
+          jq -S '[.assets[] | select(
+            .name != "NapCat.Framework.zip" and
+            .name != "NapCat.Shell.zip" and
+            .name != "NapCat.Shell.Windows.Node.zip" and
+            .name != "SHA256SUMS.txt"
+          ) | {name, size, digest}] | sort_by(.name)' \
+            "$RUNNER_TEMP/release-before.json" > "$RUNNER_TEMP/unrelated-assets-before.json"
+          jq -r '"Release: \(.html_url)\nName: \(.name)\nExisting assets: \(.assets | length)"' \
+            "$RUNNER_TEMP/release-before.json"
+
+      - name: Replace only the three ZIP assets and add their checksum manifest
+        shell: bash
+        working-directory: historical-release
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            NapCat.Framework.zip \
+            NapCat.Shell.zip \
+            NapCat.Shell.Windows.Node.zip \
+            SHA256SUMS.txt \
+            --clobber
+
+      - name: Verify published Release asset digests and preservation of unrelated assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > "$RUNNER_TEMP/release-after.json"
+          jq -e --arg tag "$TAG" '.tag_name == $tag and .draft == false and .prerelease == false' \
+            "$RUNNER_TEMP/release-after.json" >/dev/null
+
+          jq -S '[.assets[] | select(
+            .name != "NapCat.Framework.zip" and
+            .name != "NapCat.Shell.zip" and
+            .name != "NapCat.Shell.Windows.Node.zip" and
+            .name != "SHA256SUMS.txt"
+          ) | {name, size, digest}] | sort_by(.name)' \
+            "$RUNNER_TEMP/release-after.json" > "$RUNNER_TEMP/unrelated-assets-after.json"
+          diff -u "$RUNNER_TEMP/unrelated-assets-before.json" "$RUNNER_TEMP/unrelated-assets-after.json"
+
+          python3 - "$RUNNER_TEMP/release-after.json" <<'PY'
+          import json
+          import sys
+
+          release = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected = {
+              "NapCat.Framework.zip": (36823348, "sha256:118d66bb4849b7fcec05a4cafc9e33ed44f9236d56661f7097aba2ab3081df2e"),
+              "NapCat.Shell.zip": (35967555, "sha256:02e5ff0f79916c1e04c81c1b4590056406fb4293f1f1300c955e71fd08b2829d"),
+              "NapCat.Shell.Windows.Node.zip": (124162399, "sha256:77397ac38d66f46383e48f08f35d5f9d37ec575c22069f62d6c600e73b4521ed"),
+          }
+          assets = {item["name"]: item for item in release["assets"]}
+          for name, (size, digest) in expected.items():
+              item = assets.get(name)
+              if item is None or item.get("size") != size or item.get("digest") != digest:
+                  raise SystemExit(f"Published asset failed verification: {name}: {item}")
+              print(name, item["size"], item["digest"], "PASS")
+          if "SHA256SUMS.txt" not in assets:
+              raise SystemExit("SHA256SUMS.txt was not published")
+          print("Unrelated release assets and release metadata were preserved.")
+          PY
